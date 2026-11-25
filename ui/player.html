@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{{NAME}} · Ark 播放</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #05070d; }
+  body { display: flex; flex-direction: column; overflow: hidden;
+         font: 13px/1.5 -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif; color: #e2e8f0; }
+  #bar { position: fixed; top: 0; left: 0; right: 0; z-index: 20;
+         display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+         background: linear-gradient(180deg, rgba(2,6,23,.92), rgba(2,6,23,.55) 70%, rgba(2,6,23,0));
+         transition: opacity .25s; }
+  #bar.hide { opacity: 0; pointer-events: none; }
+  #openDir { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px;
+             padding: 7px 13px; border-radius: 9px; text-decoration: none; font-weight: 700;
+             color: #fff; background: linear-gradient(180deg, #8b5cf6, #7c3aed);
+             border: 1px solid #7c3aed; box-shadow: 0 6px 18px rgba(124,58,237,.35); }
+  #openDir:hover { background: linear-gradient(180deg, #9d70f8, #8b5cf6); }
+  #name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+          white-space: nowrap; font-weight: 600; color: #f1f5f9;
+          text-shadow: 0 1px 3px rgba(0,0,0,.8); }
+  #dirTag { flex: 0 0 auto; max-width: 40vw; overflow: hidden; text-overflow: ellipsis;
+            white-space: nowrap; color: #94a3b8; font-size: 12px; }
+  #wrap { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; min-height: 0; }
+  video { width: 100%; height: 100%; background: #000; outline: none; }
+  #hint { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+          color: #94a3b8; font-size: 12px; background: rgba(2,6,23,.75);
+          border: 1px solid rgba(148,163,184,.2); border-radius: 999px; padding: 5px 12px;
+          z-index: 15; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <a id="openDir" href="{{DIR_URL}}" title="在 Ark-push 工作台打开所在目录">📂 打开目录</a>
+    <div id="name" title="{{NAME}}">{{NAME}}</div>
+    <div id="dirTag" title="{{DIR}}">{{DIR}}</div>
+  </div>
+  <div id="wrap">
+    <video id="v" controls autoplay playsinline preload="metadata" src="{{STREAM}}"></video>
+  </div>
+  <div id="hint">鼠标移出 3 秒后隐藏顶部栏 · 移回顶部可再次显示</div>
+<script>
+(function () {
+  var bar = document.getElementById('bar');
+  var hint = document.getElementById('hint');
+  var v = document.getElementById('v');
+  var timer = null;
+  function show() { bar.classList.remove('hide'); if (hint) hint.style.display = 'none'; }
+  function schedule() {
+    clearTimeout(timer);
+    timer = setTimeout(function () { bar.classList.add('hide'); }, 3000);
+  }
+  document.addEventListener('mousemove', function (e) {
+    if (e.clientY <= 90) { show(); } else { schedule(); }
+  });
+  show(); schedule();
+  if (v) {
+    v.addEventListener('error', function () {
+      if (hint) { hint.style.display = ''; hint.textContent = '播放失败：直链可能已过期，请回到 Ark播放 重新点击播放'; }
+    });
+  }
+})();
+</script>
+</body>
+</html>

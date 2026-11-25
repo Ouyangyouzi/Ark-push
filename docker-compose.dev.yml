@@ -1,0 +1,28 @@
+services:
+  ark-push-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: ark-push:dev
+    container_name: ark-push-dev
+    restart: unless-stopped
+    init: true
+    working_dir: /app
+    ports:
+      - "17701:7701"
+    environment:
+      TZ: Asia/Shanghai
+      STATE_DIR: /state
+      UI_DIR: /app/ui
+      HTTP_PORT: "7701"
+      LITEPAN_URL: http://host.docker.internal:5211
+      LITEPAN_USERNAME: admin
+      LINK_ENABLED: "on"
+      LINK_115: "off"
+      LOG_LEVEL: info
+      CARGO_TARGET_DIR: /app/.target-dev
+    volumes:
+      # 整个项目目录挂载进容器：源码、UI、Cargo.toml 修改立即可见
+      - ./:/app
+      # 状态独立持久化，避免每次重建丢登录/待生成
+      - ./data/state:/state

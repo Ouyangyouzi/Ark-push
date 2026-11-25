@@ -1,0 +1,56 @@
+# Ark-push 生产部署模板
+#
+# 快速启动（默认拉取 GHCR 预构建镜像）:
+#   docker compose up -d
+#   若报 401/denied，先 docker login ghcr.io，或到网页把 GHCR 包改为 Public
+#
+# 从源码本地构建:
+#   取消下方 "build: ." 的注释并把 image 改成 ark-push:local，然后 docker compose up -d --build
+#
+# 详细说明见 INSTALL.md。变量模板见 .env.example（Compose 会自动读取同目录的 .env）。
+
+services:
+  ark-push:
+    # 远程拉取地址：GHCR 上完整镜像名（含仓库路径），Compose 会直接拉取它
+    # 若 GHCR 包为私有，先执行 docker login ghcr.io，或到网页把包改为 Public
+    # 想用自己 fork 的镜像，直接把下面这行改成 ghcr.io/<你的用户名>/<仓库名>:latest
+    image: ghcr.io/ouyangyouzi/ark-push:latest
+    # 想自己从源码构建时，取消下面这行注释，并把上面 image 改成 ark-push:local
+    # build: .
+    container_name: ark-push
+    restart: unless-stopped
+
+    ports:
+      # 格式: "<宿主端口>:7701"；宿主端口冲突时改左侧数字
+      - "7701:7701"
+
+    environment:
+      - TZ=Asia/Shanghai
+      # 115 直链开关；按需开启
+      - LINK_115=off
+      # LitePan 后端地址：容器通过网络访问远程 LitePan，改成你自己的地址
+      - LITEPAN_URL=https://<你的LitePan域名>:<端口>
+      # 账号密码也可在 Web「设置 → 连接」页填写并保存，此时下面两行可留空
+      - LITEPAN_USERNAME=admin
+      # - LITEPAN_PASSWORD=
+      # 自签证书的 HTTPS 需要开启（对应 Web 设置里的 litepan_insecure）
+      - LITEPAN_INSECURE=on
+      - STATE_DIR=/state
+      - STRM_ROOT=/src
+      - LOG_LEVEL=info
+
+    volumes:
+      # 唯一需要持久化的数据卷：设置 / 会话 / 待生成 / 全文索引 / 文件索引
+      - ./data/state:/state
+      # 如需挂载本地 STRM / 海报目录，取消注释并改成实际路径
+      # - ./data/strm:/src:ro
+
+    # 若 LitePan 在同机宿主机上（非容器），才需要下面这项让容器解析 host.docker.internal；
+    # 使用远程 LitePan 地址时无需配置
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+    # 3GB 内存环境下建议留出余量；Rust + 内嵌索引通常远低于 500MB
+    # mem_limit: 1g
+
+    # 镜像内已配置 HEALTHCHECK（每 30s 请求 /health），状态可用 docker compose ps 查看

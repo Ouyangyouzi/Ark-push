@@ -1,0 +1,7 @@
+target/
+.target-dev/
+data/
+*.log
+.env
+login.json
+search.json

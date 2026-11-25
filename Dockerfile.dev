@@ -1,0 +1,21 @@
+# Development image: mounts the project and rebuilds on source changes.
+FROM rust:1.90-bookworm
+
+# cargo-watch is only used by the dev container.
+RUN cargo install cargo-watch --version 8.5.3 --locked
+
+WORKDIR /app
+
+ENV CARGO_TARGET_DIR=/app/.target-dev \
+    STATE_DIR=/state \
+    UI_DIR=/app/ui \
+    HTTP_PORT=7701 \
+    LITEPAN_URL=http://host.docker.internal:5211 \
+    LITEPAN_USERNAME=admin \
+    LINK_ENABLED=on \
+    LINK_115=off \
+    LOG_LEVEL=info
+
+EXPOSE 7701
+
+CMD ["cargo", "watch", "--poll", "--delay", "2", "-w", "src", "-w", "ui", "-x", "run --release -- serve"]
