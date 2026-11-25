@@ -51,6 +51,19 @@ fn dig<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     None
 }
 
+fn ark_self_hint(body: &str) -> Option<&'static str> {
+    if body.contains("请求体不是合法 JSON")
+        || body.contains("未登录或会话已过期")
+        || body.contains("\"index_alias\"")
+    {
+        Some(
+            "这个地址指向的是 Ark-push 自己,不是 LitePan。请填写 LitePan 地址(默认 http://host.docker.internal:5211 或 http://宿主机IP:5211);如果用反向代理,反代必须指向 LitePan 的 5211 端口,而不是 Ark-push 的 7701。",
+        )
+    } else {
+        None
+    }
+}
+
 pub struct LitePanClient {
     pub base: String,
     pub username: String,
@@ -176,13 +189,20 @@ impl LitePanClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if status == StatusCode::UNAUTHORIZED {
+            if let Some(hint) = ark_self_hint(&text) {
+                return Err(LitePanError::Message(hint.into()));
+            }
             return Err(LitePanError::Auth("(401)".into()));
         }
         if !status.is_success() {
+            let body = text.chars().take(300).collect::<String>();
+            if let Some(hint) = ark_self_hint(&body) {
+                return Err(LitePanError::Message(hint.into()));
+            }
             return Err(LitePanError::Message(format!(
                 " HTTP {}:{}",
                 status.as_u16(),
-                text.chars().take(200).collect::<String>()
+                body
             )));
         }
         let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -254,6 +274,9 @@ impl LitePanClient {
             let text = resp.text().await.unwrap_or_default();
             if !status.is_success() {
                 let body = text.chars().take(300).collect::<String>();
+                if let Some(hint) = ark_self_hint(&body) {
+                    return Err(LitePanError::Message(hint.into()));
+                }
                 let low = body.to_lowercase();
                 // 115/合盘常用 502 + “文件不存在或已删除” 表示对象已删除，
                 // 必须当成 NotFound，否则搜索会把已删除文件一直留在索引里。
