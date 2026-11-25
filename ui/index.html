@@ -2664,7 +2664,7 @@ async function openActorEmby(name){
   toast("正在查找 " + name + " 在 " + SERVICES[svc].label + " 中的页面…");
   try {
     const d = await api("/api/emby/person", {
-      url: c.url, key: c.key, user: c.user, pass: c.pass, name
+      url: c.url, mode: c.mode, key: c.mode === "key" ? c.key : "", user: c.user, pass: c.pass, name
     });
     if (!d.ok) throw new Error(d.error || "查找失败");
     const url = d.id ? d.details : d.list;
@@ -4153,7 +4153,7 @@ function renderSvcCard(){
       + '<option value="key"' + (c.mode === "key" ? " selected" : "") + '>API Key</option>'
       + '<option value="user"' + (c.mode === "user" ? " selected" : "") + '>用户名 + 密码</option>'
       + '</select></div>'
-      + '<div class="f"><label>API Key</label><div class="hint">后台 → 设置 → API 密钥</div>'
+      + '<div class="f" id="cfgKeyBox" style="' + (c.mode === "user" ? "display:none" : "") + '"><label>API Key</label><div class="hint">后台 → 设置 → API 密钥</div>'
       + '<input id="cfgKey" type="password" value="' + esc(c.key) + '" placeholder="API Key"></div>'
       + '<div class="f"><label>连接测试</label><div class="svc-status ' + (c.ok ? "ok" : (c.ok === false ? "err" : "")) + '" id="cfgStatus">' + esc(c.status || "未测试") + '</div>'
       + '<button class="btn primary" id="cfgTest">测试</button></div>'
@@ -4185,8 +4185,11 @@ function renderSvcCard(){
   const modeSel = $("cfgMode");
   if (modeSel) modeSel.addEventListener("change", () => {
     const c2 = matchCfg(svc); c2.mode = modeSel.value; saveSettings();
-    $("cfgUserBox").style.display = modeSel.value === "user" ? "" : "none";
-    $("cfgPassBox").style.display = modeSel.value === "user" ? "" : "none";
+    const userMode = modeSel.value === "user";
+    $("cfgUserBox").style.display = userMode ? "" : "none";
+    $("cfgPassBox").style.display = userMode ? "" : "none";
+    const keyBox = $("cfgKeyBox");
+    if (keyBox) keyBox.style.display = userMode ? "none" : "";
   });
   // 保存
   $("cfgSave") && $("cfgSave").addEventListener("click", () => {});
@@ -4201,7 +4204,7 @@ function renderSvcCard(){
     $("cfgStatus").className = "svc-status"; $("cfgStatus").textContent = "测试中…";
     try {
       if (isMedia){
-        const d = await api("/api/emby/test", { url:c2.url, key:c2.key, user:c2.user, pass:c2.pass });
+        const d = await api("/api/emby/test", { url:c2.url, mode:c2.mode, key:c2.mode === "key" ? c2.key : "", user:c2.user, pass:c2.pass });
         if (!d.ok) throw new Error(d.error || "连接失败");
         c2.ok = true; c2.status = "已连接 · " + (d.server || meta.label) + " v" + (d.version || "?");
         saveSettings();

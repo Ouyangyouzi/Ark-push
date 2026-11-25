@@ -2,7 +2,7 @@
 
 > **LitePan 的边车服务（Rust 重写版）** · 不依赖 Meilisearch · 单二进制 · 单端口 `7701`
 >
-> 当前版本：`0.1.32`
+> 当前版本：`0.1.33`
 
 Ark-push 是 `Arkpan-push` 的 Rust 重写实现。它保留 LitePan 边车的完整工作流——搜索、离线推送、STRM 管理、演员资料、备份——但**移除了 Meilisearch 进程和 `/meili_data` 数据卷**，把全文检索换成进程内嵌的 SQLite FTS5 索引。
 

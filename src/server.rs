@@ -2968,20 +2968,249 @@ async fn actor_cache_actors(State(st): State<Arc<AppState>>, Query(q): Query<Has
     ok(json!({"ok": true, "items": items, "total": total, "limit": limit}))
 }
 
+fn emby_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            // 家庭媒体服务器经常用自签证书
+            .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(12))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn emby_base(url: &str) -> String {
+    let mut u = url.trim().trim_end_matches('/').to_string();
+    if u.is_empty() {
+        return u;
+    }
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        u = format!("http://{u}");
+    }
+    u
+}
+
+struct EmbyAuth {
+    base: String,
+    prefix: String,
+    token: String,
+    server: String,
+    version: String,
+}
+
+fn emby_pick(v: &Value, keys: &[&str]) -> String {
+    for k in keys {
+        if let Some(s) = v.get(*k).and_then(Value::as_str) {
+            if !s.trim().is_empty() {
+                return s.trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// 同时兼容 Emby(/emby) 和 Jellyfin(根路径)：
+/// - API Key: GET System/Info
+/// - 用户名密码: POST Users/AuthenticateByName 换 AccessToken
+async fn emby_auth(v: &Value) -> Result<EmbyAuth, String> {
+    // 兼容两种入参：{url,key,...} 和 {name, emby:{url,key,...}}
+    let src = v.get("emby").filter(|x| x.is_object()).unwrap_or(v);
+    let base = emby_base(&json_str(src, "url"));
+    if base.is_empty() {
+        return Err("缺少服务地址".into());
+    }
+    let mode = json_str(src, "mode");
+    let key = json_str(src, "key");
+    let user = json_str(src, "user");
+    let pass = json_str(src, "pass");
+    let use_key = if mode == "user" { false } else { !key.is_empty() };
+    let client = emby_client();
+    let prefixes = ["", "/emby"];
+
+    if use_key {
+        for p in prefixes {
+            let url = format!("{base}{p}/System/Info?api_key={}", urlencoding::encode(&key));
+            if let Ok(resp) = client.get(&url).header("X-Emby-Token", &key).send().await {
+                if resp.status().is_success() {
+                    let info: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+                    return Ok(EmbyAuth {
+                        base: base.clone(),
+                        prefix: p.to_string(),
+                        token: key.clone(),
+                        server: emby_pick(&info, &["ServerName", "Name"]),
+                        version: emby_pick(&info, &["Version"]),
+                    });
+                }
+            }
+        }
+        return Err("API Key 无效，或服务地址不可达".into());
+    }
+
+    if user.is_empty() || pass.is_empty() {
+        return Err("请填写 API Key，或用户名 + 密码".into());
+    }
+    let mut last_err = String::new();
+    for p in prefixes {
+        let url = format!("{base}{p}/Users/AuthenticateByName");
+        let resp = client
+            .post(&url)
+            .header(
+                "X-Emby-Authorization",
+                "MediaBrowser Client=\"Ark-push\", Device=\"Ark-push\", DeviceId=\"ark-push\", Version=\"1.0\"",
+            )
+            .json(&json!({"Username": user, "Pw": pass}))
+            .send()
+            .await;
+        let Ok(resp) = resp else {
+            last_err = "网络不可达".into();
+            continue;
+        };
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            last_err = format!("HTTP {}: {}", status.as_u16(), text.chars().take(160).collect::<String>());
+            continue;
+        }
+        let val: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+        let token = emby_pick(&val, &["AccessToken", "accessToken"]);
+        if token.is_empty() {
+            last_err = "登录成功但没有返回 AccessToken".into();
+            continue;
+        }
+        let info_url = format!("{base}{p}/System/Info?api_key={}", urlencoding::encode(&token));
+        let info: Value = match client
+            .get(&info_url)
+            .header("X-Emby-Token", &token)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| json!({})),
+            _ => json!({}),
+        };
+        return Ok(EmbyAuth {
+            base: base.clone(),
+            prefix: p.to_string(),
+            token,
+            server: emby_pick(&info, &["ServerName", "Name"]),
+            version: emby_pick(&info, &["Version"]),
+        });
+    }
+    Err(format!("登录失败:{last_err}"))
+}
+
+/// 在 Emby/Jellyfin 里找演员(Person)的 Id。
+async fn emby_find_person(auth: &EmbyAuth, name: &str) -> Result<(String, String), String> {
+    let client = emby_client();
+    let q = urlencoding::encode(name);
+    let url = format!(
+        "{}{}/Persons?SearchTerm={}&Limit=20&Fields=Name&api_key={}",
+        auth.base,
+        auth.prefix,
+        q,
+        urlencoding::encode(&auth.token)
+    );
+    let resp = client
+        .get(&url)
+        .header("X-Emby-Token", &auth.token)
+        .send()
+        .await
+        .map_err(|e| format!("查询演员失败:{e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("查询演员失败:HTTP {}:{}", status.as_u16(), text.chars().take(160).collect::<String>()));
+    }
+    let val: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    let want = norm_actor_name(name).to_lowercase();
+    let items = val.get("Items").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut fallback = String::new();
+    for it in items {
+        let id = emby_pick(&it, &["Id", "id"]);
+        let n = emby_pick(&it, &["Name", "name"]);
+        if id.is_empty() {
+            continue;
+        }
+        if fallback.is_empty() {
+            fallback = id.clone();
+        }
+        if norm_actor_name(&n).to_lowercase() == want {
+            return Ok((id, n));
+        }
+    }
+    if !fallback.is_empty() {
+        return Ok((fallback, name.to_string()));
+    }
+    Err("服务里没有找到这个演员".into())
+}
+
 async fn emby_test(State(_st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
-    let _ = parse_body(&body).unwrap_or_else(|_| json!({}));
-    Ok(ok(json!({"ok": false, "error": "Emby 匹配服务未配置"})))
+    let v = parse_body(&body)?;
+    match emby_auth(&v).await {
+        Ok(a) => Ok(ok(json!({
+            "ok": true, "server": if a.server.is_empty() { "Emby".to_string() } else { a.server },
+            "version": if a.version.is_empty() { "?".to_string() } else { a.version },
+            "prefix": a.prefix,
+        }))),
+        Err(e) => Ok(ok(json!({"ok": false, "error": e}))),
+    }
 }
 
 async fn emby_person(State(_st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
     let v = parse_body(&body)?;
     let name = json_str(&v, "name");
-    Ok(ok(json!({"ok": false, "error": "Emby 匹配服务未配置", "name": name})))
+    if name.is_empty() {
+        return Ok(ok(json!({"ok": false, "error": "缺少演员名"})));
+    }
+    let Ok(auth) = emby_auth(&v).await else {
+        return Ok(ok(json!({"ok": false, "error": "匹配服务连接失败,请先在设置里测试连接", "name": name})));
+    };
+    let q = urlencoding::encode(&name);
+    let list = format!("{}{}/web/index.html#!/search.html?query={}", auth.base, auth.prefix, q);
+    match emby_find_person(&auth, &name).await {
+        Ok((id, matched_name)) => {
+            let details = if auth.prefix.is_empty() {
+                format!("{}/web/index.html#!/details?id={}", auth.base, id)
+            } else {
+                format!("{}{}/web/index.html#!/person?id={}", auth.base, auth.prefix, id)
+            };
+            Ok(ok(json!({
+                "ok": true, "id": id, "name": matched_name,
+                "details": details, "list": list,
+            })))
+        }
+        Err(e) => Ok(ok(json!({"ok": true, "id": "", "name": name, "details": "", "list": list, "note": e}))),
+    }
 }
 
 async fn emby_count(State(_st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
     let v = parse_body(&body)?;
-    Ok(ok(json!({"ok": false, "error": "未配置 Emby 匹配服务", "name": json_str(&v, "name"), "count": 0})))
+    let name = json_str(&v, "name");
+    if name.is_empty() {
+        return Ok(ok(json!({"ok": false, "error": "缺少演员名", "name": name, "count": 0})));
+    }
+    let Ok(auth) = emby_auth(&v).await else {
+        return Ok(ok(json!({"ok": false, "error": "匹配服务未连接", "name": name, "count": 0})));
+    };
+    let Ok((id, _)) = emby_find_person(&auth, &name).await else {
+        return Ok(ok(json!({"ok": true, "name": name, "count": 0})));
+    };
+    let client = emby_client();
+    let url = format!(
+        "{}{}/Items?Recursive=true&PersonIds={}&IncludeItemTypes=Movie,Episode&Limit=1&api_key={}",
+        auth.base,
+        auth.prefix,
+        urlencoding::encode(&id),
+        urlencoding::encode(&auth.token)
+    );
+    let count = match client.get(&url).header("X-Emby-Token", &auth.token).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let val: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+            val.get("TotalRecordCount").and_then(Value::as_i64).unwrap_or(0)
+        }
+        _ => 0,
+    };
+    Ok(ok(json!({"ok": true, "name": name, "count": count})))
 }
 
 // ---------------------------------------------------------------- Ark
