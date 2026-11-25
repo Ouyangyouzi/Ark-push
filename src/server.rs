@@ -36,6 +36,8 @@ use tower_http::cors::{Any, CorsLayer};
 #[derive(Default)]
 pub struct DirCache {
     inner: parking_lot::RwLock<HashMap<(i64, String), DirCacheEntry>>,
+    /// 最近确认“没有这个演员目录”的名字，避免每次匹配都重复探测
+    misses: parking_lot::RwLock<HashMap<(i64, String), Instant>>,
 }
 
 struct DirCacheEntry {
@@ -83,8 +85,24 @@ impl DirCache {
         );
     }
 
+    pub fn is_recent_miss(&self, account_id: i64, name: &str) -> bool {
+        let map = self.misses.read();
+        map.get(&(account_id, name.to_string()))
+            .map(|t| t.elapsed().as_secs() <= 30)
+            .unwrap_or(false)
+    }
+
+    pub fn mark_miss(&self, account_id: i64, name: &str) {
+        let mut map = self.misses.write();
+        if map.len() > 4096 {
+            map.retain(|_, t| t.elapsed().as_secs() <= 30);
+        }
+        map.insert((account_id, name.to_string()), Instant::now());
+    }
+
     pub fn clear(&self) {
         self.inner.write().clear();
+        self.misses.write().clear();
     }
 }
 
@@ -2580,14 +2598,23 @@ async fn actor_match_roots(st: &AppState, client: &crate::litepan::LitePanClient
 
 /// 有的演员能搜到、有的搜不到，旧逻辑是索引未命中就做整棵树 BFS（600 个目录，经常超时）。
 /// 改成“演员桶目录”定向探测：索引父目录 + 根目录一级子目录，最多 80 次 resolve，8 路并发。
-/// 是否是“演员桶”：mov / mov-A2 / FC2 / 91 / 步兵 这类目录，而不是演员目录本身。
+/// 是否是“演员桶”：mov-A7 / mov-10 / FC2-xxx 这类目录，而不是演员目录本身。
 fn bucketish(name: &str) -> bool {
     let low = name.to_lowercase();
-    low.starts_with("mov")
-        || low.contains("movies")
-        || low.starts_with("fc2")
-        || low.starts_with("91")
-        || matches!(name, "步兵" | "骑兵" | "無碼" | "无码" | "有码" | "有碼" | "素人" | "糖心Vlog")
+    low.starts_with("mov-")
+        || low.starts_with("fc2-")
+        || low.starts_with("91-")
+        || low.starts_with("300mium")
+        || low.starts_with("heydouga")
+}
+
+/// 是否是“桶容器”：mov / 91 / FC2 / 步兵 这类，下面才是 mov-A7 这种演员桶。
+fn containerish(name: &str) -> bool {
+    let low = name.to_lowercase();
+    matches!(
+        low.as_str(),
+        "mov" | "movies" | "91" | "fc2" | "步兵" | "骑兵" | "无码" | "無碼" | "有码" | "有碼" | "素人" | "糖心vlog"
+    ) || low.contains("movies")
 }
 
 async fn discover_actor_dirs(
@@ -2595,13 +2622,39 @@ async fn discover_actor_dirs(
     client: Arc<crate::litepan::LitePanClient>,
     account_id: i64,
     names: &[String],
+    root_hint: &str,
 ) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     let mut buckets: Vec<String> = Vec::new();
-    let roots = actor_match_roots(st, &client).await;
+    let mut roots: Vec<String> = Vec::new();
+    let hint = root_hint.trim_matches('/').trim();
+    if !hint.is_empty() {
+        roots.push(hint.to_string());
+    }
+    for r in actor_match_roots(st, &client).await {
+        if !roots.contains(&r) {
+            roots.push(r);
+        }
+    }
+    let mut expand: Vec<(String, String)> = Vec::new();
     // 先放配置的根目录及一级子目录（mov、mov-A2…这些才是真正的“演员桶”）。
-    for root in roots.iter().cloned() {
-        let rp = format!("/{}", root.trim_matches('/'));
+    for root in roots.iter().cloned().take(8) {
+        if buckets.len() >= 80 {
+            break;
+        }
+        let root_path = root.trim_matches('/').to_string();
+        // STRM 任务经常把“演员目录”本身当根（.../mov-A7/桃園怜奈），
+        // 这种情况直接取它的父目录当桶，不用再列一遍演员目录里的几十个文件。
+        if let Some((parent, _)) = root_path.rsplit_once('/') {
+            let parent_base = parent.rsplit('/').next().unwrap_or("");
+            if bucketish(parent_base) {
+                if !buckets.contains(&parent.to_string()) {
+                    buckets.push(parent.to_string());
+                }
+                continue;
+            }
+        }
+        let rp = format!("/{}", root_path);
         let Ok(resolved) = client.resolve_dir(account_id, &rp, false).await else {
             continue;
         };
@@ -2609,7 +2662,6 @@ async fn discover_actor_dirs(
         if pid.is_empty() {
             continue;
         }
-        let root_path = root.trim_matches('/').to_string();
         if !buckets.contains(&root_path) {
             buckets.push(root_path.clone());
         }
@@ -2640,7 +2692,53 @@ async fn discover_actor_dirs(
                     }
                 }
             }
-            if buckets.len() < 120 && !buckets.contains(&full) {
+            if bucketish(&name) {
+                if buckets.len() < 120 && !buckets.contains(&full) {
+                    buckets.push(full);
+                }
+            } else if containerish(&name) {
+                expand.push((full, json_str(&it, "id")));
+            } else if buckets.len() < 120 && !buckets.contains(&full) {
+                buckets.push(full);
+            }
+        }
+    }
+    // 展开一层容器：Zpool/movies/mov → mov-A2 / mov-A7…，这些才是演员目录的父目录。
+    // 索引为空（新部署/换了服务器）时，这一步是演员匹配能否成功的关键。
+    let expanded: Vec<(String, Vec<Value>)> = futures::stream::iter(expand.into_iter().take(16).map(|(base, id)| {
+        let client = client.clone();
+        async move {
+            if id.is_empty() {
+                return (base, Vec::new());
+            }
+            match client.list_dir(account_id, &id, "", None).await {
+                Ok(v) => (base, v.get("items").and_then(Value::as_array).cloned().unwrap_or_default()),
+                Err(_) => (base, Vec::new()),
+            }
+        }
+    }))
+    .buffer_unordered(8)
+    .collect()
+    .await;
+    for (base, rows) in expanded {
+        for it in rows {
+            if !json_bool(&it, "is_dir", false) {
+                continue;
+            }
+            let name = json_str(&it, "name");
+            if name.is_empty() {
+                continue;
+            }
+            let full = format!("{base}/{name}").trim_matches('/').to_string();
+            for want in names {
+                if actor_name_hit(&name, want) {
+                    let e = out.entry(want.clone()).or_default();
+                    if !e.contains(&full) && e.len() < 20 {
+                        e.push(full.clone());
+                    }
+                }
+            }
+            if bucketish(&name) && buckets.len() < 120 && !buckets.contains(&full) {
                 buckets.push(full);
             }
         }
@@ -2670,21 +2768,24 @@ async fn discover_actor_dirs(
         let base = b.rsplit('/').next().unwrap_or("").to_lowercase();
         let bucket_rank = if bucketish(&base) { 0 } else { 1 };
         let root_rank = if related(b) { 0 } else { 1 };
-        (root_rank, bucket_rank, b.chars().count())
+        // mov-A* 桶优先，保证像 mov-A8 这种靠后的桶也在探测范围内。
+        (bucket_rank, root_rank, b.chars().count())
     });
     buckets.dedup();
 
     let mut probes: Vec<(String, String)> = Vec::new();
-    for want in names {
-        // 即使索引里有模糊命中，也要探测精确的 <桶>/<演员名>，
-        // 否则新建的演员目录会被 “ZZ” 之类的模糊结果挡住。
-        for b in buckets.iter().take(48) {
+    for (i, want) in names.iter().enumerate() {
+        // 即使索引里有模糊命中，也要探测精确的 <桶>/<演员名>。
+        // 只给前 3 个名字足量桶位（通常是女演员），男演员/片商名只做少量探测，
+        // 否则一次匹配会发出上百个请求，反代下直接超时。
+        let take = if i == 0 { 48 } else if i < 3 { 16 } else { 6 };
+        for b in buckets.iter().take(take) {
             probes.push((b.clone(), want.clone()));
-            if probes.len() >= 300 {
+            if probes.len() >= 120 {
                 break;
             }
         }
-        if probes.len() >= 300 {
+        if probes.len() >= 120 {
             break;
         }
     }
@@ -2755,6 +2856,7 @@ async fn actor_dirs(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
         return Err(bad("缺少 names"));
     }
     st.fileindex.ensure_known();
+    let root_hint = v.get("root").and_then(Value::as_str).unwrap_or("").trim_matches('/').to_string();
     let mut map = Map::new();
     let validator = st.pool.client_for(&Value::Null).await.ok();
     let account_id = match &validator {
@@ -2800,6 +2902,9 @@ async fn actor_dirs(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
     let missing: Vec<String> = names
         .iter()
         .filter(|n| {
+            if st.dir_cache.is_recent_miss(account_id, n) {
+                return false;
+            }
             let want = norm_actor_name(n).to_lowercase();
             let has_exact = map
                 .get(*n)
@@ -2816,7 +2921,7 @@ async fn actor_dirs(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
         .collect();
     if !missing.is_empty() {
         if let Some(client) = &validator {
-            let live = discover_actor_dirs(&st, client.clone(), account_id, &missing).await;
+            let live = discover_actor_dirs(&st, client.clone(), account_id, &missing, &root_hint).await;
             for (name, dirs) in live {
                 if !dirs.is_empty() {
                     let mut merged: Vec<String> = map
@@ -2869,6 +2974,11 @@ async fn actor_dirs(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
             }
         }
         map = clean;
+    }
+    for n in &names {
+        if !map.contains_key(n) {
+            st.dir_cache.mark_miss(account_id, n);
+        }
     }
     Ok(ok(json!({"ok": true, "map": map, "source": "fileindex+live", "tree": {"ready": true, "building": false, "age": 0, "scanned": 0}})))
 }
