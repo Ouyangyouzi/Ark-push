@@ -36,8 +36,6 @@ use tower_http::cors::{Any, CorsLayer};
 #[derive(Default)]
 pub struct DirCache {
     inner: parking_lot::RwLock<HashMap<(i64, String), DirCacheEntry>>,
-    /// 最近确认“没有这个演员目录”的名字，避免每次匹配都重复探测
-    misses: parking_lot::RwLock<HashMap<(i64, String), Instant>>,
 }
 
 struct DirCacheEntry {
@@ -85,24 +83,8 @@ impl DirCache {
         );
     }
 
-    pub fn is_recent_miss(&self, account_id: i64, name: &str) -> bool {
-        let map = self.misses.read();
-        map.get(&(account_id, name.to_string()))
-            .map(|t| t.elapsed().as_secs() <= 30)
-            .unwrap_or(false)
-    }
-
-    pub fn mark_miss(&self, account_id: i64, name: &str) {
-        let mut map = self.misses.write();
-        if map.len() > 4096 {
-            map.retain(|_, t| t.elapsed().as_secs() <= 30);
-        }
-        map.insert((account_id, name.to_string()), Instant::now());
-    }
-
     pub fn clear(&self) {
         self.inner.write().clear();
-        self.misses.write().clear();
     }
 }
 
@@ -2902,9 +2884,6 @@ async fn actor_dirs(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
     let missing: Vec<String> = names
         .iter()
         .filter(|n| {
-            if st.dir_cache.is_recent_miss(account_id, n) {
-                return false;
-            }
             let want = norm_actor_name(n).to_lowercase();
             let has_exact = map
                 .get(*n)
@@ -2974,11 +2953,6 @@ async fn actor_dirs(State(st): State<Arc<AppState>>, body: Bytes) -> ApiResult {
             }
         }
         map = clean;
-    }
-    for n in &names {
-        if !map.contains_key(n) {
-            st.dir_cache.mark_miss(account_id, n);
-        }
     }
     Ok(ok(json!({"ok": true, "map": map, "source": "fileindex+live", "tree": {"ready": true, "building": false, "age": 0, "scanned": 0}})))
 }
