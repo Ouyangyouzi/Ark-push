@@ -1,6 +1,6 @@
 [package]
 name = "ark-push"
-version = "0.1.39"
+version = "0.1.42"
 edition = "2021"
 description = "Ark-push: a Rust sidecar for LitePan (no Meilisearch required)"
 license = "MIT"

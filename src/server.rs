@@ -2608,14 +2608,17 @@ async fn discover_actor_dirs(
 ) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     let mut buckets: Vec<String> = Vec::new();
+    let mut bucket_ids: HashMap<String, String> = HashMap::new();
     let mut roots: Vec<String> = Vec::new();
     let hint = root_hint.trim_matches('/').trim();
     if !hint.is_empty() {
+        // 脚本已经给了演员根目录，就只扫它，避免把几十个 STRM 任务目录都算进来。
         roots.push(hint.to_string());
-    }
-    for r in actor_match_roots(st, &client).await {
-        if !roots.contains(&r) {
-            roots.push(r);
+    } else {
+        for r in actor_match_roots(st, &client).await.into_iter().take(3) {
+            if !roots.contains(&r) {
+                roots.push(r);
+            }
         }
     }
     let mut expand: Vec<(String, String)> = Vec::new();
@@ -2676,6 +2679,10 @@ async fn discover_actor_dirs(
             }
             if bucketish(&name) {
                 if buckets.len() < 120 && !buckets.contains(&full) {
+                    let id = json_str(&it, "id");
+                    if !id.is_empty() {
+                        bucket_ids.insert(full.clone(), id);
+                    }
                     buckets.push(full);
                 }
             } else if containerish(&name) {
@@ -2721,6 +2728,10 @@ async fn discover_actor_dirs(
                 }
             }
             if bucketish(&name) && buckets.len() < 120 && !buckets.contains(&full) {
+                let id = json_str(&it, "id");
+                if !id.is_empty() {
+                    bucket_ids.insert(full.clone(), id);
+                }
                 buckets.push(full);
             }
         }
@@ -2750,74 +2761,64 @@ async fn discover_actor_dirs(
         let base = b.rsplit('/').next().unwrap_or("").to_lowercase();
         let bucket_rank = if bucketish(&base) { 0 } else { 1 };
         let root_rank = if related(b) { 0 } else { 1 };
-        // mov-A* 桶优先，保证像 mov-A8 这种靠后的桶也在探测范围内。
-        (bucket_rank, root_rank, b.chars().count())
+        // 保持收集顺序（根目录一级子目录先收集），不要按长度重排，
+        // 否则像 mov-A3 这种真正有演员的桶会被挤到后面。
+        (bucket_rank, root_rank)
     });
     buckets.dedup();
 
-    let mut probes: Vec<(String, String)> = Vec::new();
-    for (i, want) in names.iter().enumerate() {
-        // 即使索引里有模糊命中，也要探测精确的 <桶>/<演员名>。
-        // 只给前 3 个名字足量桶位（通常是女演员），男演员/片商名只做少量探测，
-        // 否则一次匹配会发出上百个请求，反代下直接超时。
-        let take = if i == 0 { 48 } else if i < 3 { 16 } else { 6 };
-        for b in buckets.iter().take(take) {
-            probes.push((b.clone(), want.clone()));
-            if probes.len() >= 120 {
-                break;
-            }
-        }
-        if probes.len() >= 120 {
-            break;
-        }
-    }
+    // 直接列“桶目录”（用已知目录 id），在目录名里找演员。
+    // 不再去 resolve 大量不存在的路径：远端反代下每个坏请求可能卡到 30 秒，
+    // 一批探测就会把 /api/actor/dirs 拖成 504。
+    let targets: Vec<(String, Option<String>)> = buckets
+        .iter()
+        .take(32)
+        .map(|b| (b.clone(), bucket_ids.get(b).cloned()))
+        .collect();
     tracing::info!(
-        "actor discover names={:?} buckets={} probes={}",
+        "actor discover names={:?} buckets={} list_targets={}",
         names,
         buckets.len(),
-        probes.len()
+        targets.len()
     );
-    let found: Vec<(String, String, String)> = futures::stream::iter(probes.into_iter().map(|(bucket, want)| {        let client = client.clone();
+    let listed: Vec<(String, Vec<Value>)> = futures::stream::iter(targets.into_iter().map(|(base, id)| {
+        let client = client.clone();
+        let cache = st.dir_cache.clone();
         async move {
-            let path = format!("{}/{}", bucket.trim_end_matches('/'), want).trim_matches('/').to_string();
-            match client.resolve_dir(account_id, &path, false).await {
-                Ok(v) => {
-                    let id = v.get("parent_id").and_then(Value::as_str).unwrap_or("").to_string();
-                    (want, path, id)
-                }
-                Err(_) => (want, String::new(), String::new()),
+            match dir_listing(&cache, &client, account_id, &base, id.as_deref()).await {
+                Ok((_, rows)) => (base, rows.as_ref().clone()),
+                Err(_) => (base, Vec::new()),
             }
         }
     }))
-    .buffer_unordered(16)
+    .buffer_unordered(12)
     .collect()
     .await;
 
-    let matched = found.iter().filter(|(_, p, _)| !p.is_empty()).count();
-    if matched > 0 {
-        tracing::info!(
-            "actor discover matched={matched} hits={:?}",
-            found
-                .iter()
-                .filter(|(_, p, _)| !p.is_empty())
-                .map(|(w, p, _)| format!("{w}=>{p}"))
-                .collect::<Vec<_>>()
-        );
-    }
-
     let mut upserts = Vec::new();
-    for (want, path, id) in found {
-        if path.is_empty() {
-            continue;
+    for (base, rows) in listed {
+        for it in rows {
+            if !json_bool(&it, "is_dir", false) {
+                continue;
+            }
+            let name = json_str(&it, "name");
+            if name.is_empty() {
+                continue;
+            }
+            let full = format!("{base}/{name}").trim_matches('/').to_string();
+            for want in names {
+                if actor_name_hit(&name, want) {
+                    let e = out.entry(want.clone()).or_default();
+                    if !e.contains(&full) && e.len() < 20 {
+                        e.push(full.clone());
+                        upserts.push(json!({
+                            "id": json_str(&it, "id"), "name": name,
+                            "path": full, "is_dir": true, "size": 0, "account_id": account_id,
+                        }));
+                    }
+                }
+            }
         }
-        let e = out.entry(want.clone()).or_default();
-        if !e.contains(&path) && e.len() < 20 {
-            e.push(path.clone());
-        }
-        upserts.push(json!({
-            "id": id, "name": path.rsplit('/').next().unwrap_or(""),
-            "path": path, "is_dir": true, "size": 0, "account_id": account_id,
-        }));
     }
     if !upserts.is_empty() {
         let _ = st.fileindex.upsert(account_id, &upserts);
